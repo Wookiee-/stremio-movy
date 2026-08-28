@@ -289,7 +289,7 @@ async function resolveMovyStream(type, stremioId, season, episode) {
           return data.sources.map((src) => ({
             name: `Movy - ${server}${src.quality ? ' (' + src.quality + ')' : ''}`,
             title: `${server}${src.quality ? ' (' + src.quality + ')' : ''}`,
-            url: `${getBaseUrl()}/proxy?url=${encodeURIComponent(src.url)}&referer=${encodeURIComponent(MOVY_BASE)}`,
+            url: src.url,
           }));
         } catch (err) {
           console.log(`[Movy] ${server}: ${err.message}`);
