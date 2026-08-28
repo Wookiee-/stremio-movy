@@ -10,6 +10,7 @@ A local proxy server that provides Stremio streams from [Movy.bz](https://www.mo
 - 🔄 Auto IMDB-to-TMDB ID conversion
 - 🌐 Proxied streaming for reliable playback
 - 🖥️ Local server with landing page
+- ⚡ Performance optimizations (streaming proxy, connection pooling, smart caching)
 
 ## Quick Start
 
@@ -66,6 +67,13 @@ stremio://127.0.0.1:7000/manifest.json
 | `GET /` | Landing page with install instructions |
 | `GET /manifest.json` | Stremio addon manifest |
 | `GET /proxy?url=<url>&referer=<referer>` | Proxies Movy video streams through the local server |
+
+## Performance
+
+- **Streaming proxy** — video responses are streamed directly to the client, never buffered in memory
+- **HTTP keep-alive pooling** — reuses TLS connections across TMDB, Movy, and proxy requests
+- **Smart TMDB lookups** — skips the `/find` call when a TMDB ID is already provided
+- **Stream caching** — results cached for 5 minutes with request deduplication
 
 ## License
 
