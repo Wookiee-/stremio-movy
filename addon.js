@@ -447,6 +447,7 @@ router.options('/proxy', (req, res) => {
 
 // --- Landing page ---
 router.get('/', (req, res) => {
+  const baseUrl = getBaseUrl(req);
   const installUrl = `stremio://${req.headers.host || '127.0.0.1:' + PORT}/manifest.json`;
   res.setHeader('Content-Type', 'text/html');
   res.send(`<!DOCTYPE html>
@@ -481,7 +482,7 @@ router.get('/', (req, res) => {
     <div class="card">
       <h3 style="margin-bottom: 15px;">Manual Install</h3>
       <p>In Stremio, go to <strong>Add-ons &#8594; Community</strong> and paste:</p>
-      <p style="margin-top: 10px;"><code>http://127.0.0.1:${PORT}/manifest.json</code></p>
+      <p style="margin-top: 10px;"><code>${baseUrl}/manifest.json</code></p>
     </div>
     <div class="card">
       <h3 style="margin-bottom: 15px;">Supported Content</h3>
