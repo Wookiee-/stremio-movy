@@ -1,0 +1,16 @@
+{
+  "name": "stremio-movy-addon",
+  "version": "1.0.0",
+  "description": "Stremio addon that provides streams from Movy.bz",
+  "main": "addon.js",
+  "scripts": {
+    "start": "node addon.js",
+    "dev": "node addon.js --launch"
+  },
+  "dependencies": {
+    "freekeys": "^0.0.4",
+    "node-fetch": "^2.7.0",
+    "stremio-addon-sdk": "^1.6.10"
+  },  "keywords": ["stremio", "addon", "movy", "streaming"],
+  "license": "MIT"
+}
