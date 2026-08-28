@@ -18,6 +18,13 @@ const MOVY_BASE = 'https://www.movy.bz';
 const MOVY_SERVERS = ['miami', 'seattle', 'denver', 'atlanta', 'phoenix', 'portland', 'cancun', 'paris'];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
 
+// Dynamic base URL — works on Vercel, local dev, or any host
+function getBaseUrl(req) {
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  if (req && req.headers && req.headers.host) return `http://${req.headers.host}`;
+  return `http://127.0.0.1:${PORT}`;
+}
+
 // Cache stream results to avoid re-scanning servers on every request
 const streamCache = new Map();
 const pendingRequests = new Map();
@@ -282,7 +289,7 @@ async function resolveMovyStream(type, stremioId, season, episode) {
           return data.sources.map((src) => ({
             name: `Movy - ${server}${src.quality ? ' (' + src.quality + ')' : ''}`,
             title: `${server}${src.quality ? ' (' + src.quality + ')' : ''}`,
-            url: `http://127.0.0.1:${PORT}/proxy?url=${encodeURIComponent(src.url)}&referer=${encodeURIComponent(MOVY_BASE)}`,
+            url: `${getBaseUrl()}/proxy?url=${encodeURIComponent(src.url)}&referer=${encodeURIComponent(MOVY_BASE)}`,
           }));
         } catch (err) {
           console.log(`[Movy] ${server}: ${err.message}`);
@@ -397,7 +404,7 @@ router.get('/proxy', async (req, res) => {
 
     if (isM3u8) {
       const body = await response.text();
-      const baseProxy = `http://127.0.0.1:${PORT}/proxy?referer=${encodeURIComponent(referer)}&url=`;
+      const baseProxy = `${getBaseUrl(req)}/proxy?referer=${encodeURIComponent(referer)}&url=`;
       let rewritten = body.replace(/^(https?:\/\/\S+)$/gm, (line) => baseProxy + encodeURIComponent(line));
       rewritten = rewritten.replace(/URI="(https?:\/\/[^"\s]+)"/g, (match, url) => `URI="${baseProxy + encodeURIComponent(url)}"`);
       res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' });
