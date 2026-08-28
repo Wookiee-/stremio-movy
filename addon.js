@@ -490,8 +490,8 @@ router.get('/', (req, res) => {
 </html>`);
 });
 
-// --- Start server ---
-const server = http.createServer((req, res) => {
+// --- Handler (exported for Vercel / serverless) ---
+function handler(req, res) {
   router(req, res, (err) => {
     if (err) {
       console.error('[Server] Router error:', err);
@@ -499,11 +499,18 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: 'Internal server error' }));
     }
   });
-});
+}
 
-server.listen(PORT, () => {
-  console.log(`\n  Movy Stream - Stremio Addon\n  Server running at: http://127.0.0.1:${PORT}\n  Manifest:           http://127.0.0.1:${PORT}/manifest.json\n  Install in Stremio: stremio://127.0.0.1:${PORT}/manifest.json\n  `);
-});
+module.exports = { handler };
 
-process.on('SIGINT', () => { server.close(() => process.exit(0)); });
-process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
+// --- Start server (local dev only) ---
+if (require.main === module) {
+  const server = http.createServer(handler);
+
+  server.listen(PORT, () => {
+    console.log(`\n  Movy Stream - Stremio Addon\n  Server running at: http://127.0.0.1:${PORT}\n  Manifest:           http://127.0.0.1:${PORT}/manifest.json\n  Install in Stremio: stremio://127.0.0.1:${PORT}/manifest.json\n  `);
+  });
+
+  process.on('SIGINT', () => { server.close(() => process.exit(0)); });
+  process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
+}
