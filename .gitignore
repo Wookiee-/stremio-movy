@@ -1,0 +1,6 @@
+.vercel
+.env*
+server.log
+node_modules/
+server-test.log
+*.log

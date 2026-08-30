@@ -7,8 +7,8 @@ const https = require('https');
 const { URL } = require('url');
 
 // --- Keep-alive connection pooling ---
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 20 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 20 });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 64 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64 });
 const freekeys = require('freekeys');
 
 // --- Configuration ---
@@ -33,14 +33,18 @@ const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 // --- TMDB metadata lookup ---
 const tmdbMetadataCache = new Map();
 let tmdbApiKey = null;
+let omdbApiKey = null;
 
-async function getTmdbKey() {
-  if (tmdbApiKey) return tmdbApiKey;
+async function getKeys() {
+  if (tmdbApiKey && omdbApiKey) return { tmdbApiKey, omdbApiKey };
+  // Prefer user-supplied keys via env (OMDB_API_KEY is the OMDb key used to
+  // bridge episode IMDb ids to their parent series). Fall back to freekeys.
   try {
-    const keys = await freekeys();
-    tmdbApiKey = keys.tmdb_key;
-    console.log('[TMDB] Got API key');
-    return tmdbApiKey;
+    const keys = await freekeys().catch(() => ({}));
+    tmdbApiKey = process.env.TMDB_API_KEY || keys.tmdb_key;
+    omdbApiKey = process.env.OMDB_API_KEY || keys.imdb_key; // freekeys' imdb_key is an OMDb key (8-hex format)
+    if (tmdbApiKey && omdbApiKey) console.log('[TMDB] Got API keys');
+    return { tmdbApiKey, omdbApiKey };
   } catch (err) {
     console.error('[TMDB] Failed to get key:', err.message);
     return null;
@@ -52,7 +56,7 @@ async function lookupTmdbMetadata(imdbId, tmdbId, mediaType) {
   const cached = tmdbMetadataCache.get(cacheKey);
   if (cached) return cached;
 
-  const key = await getTmdbKey();
+  const { tmdbApiKey: key, omdbApiKey } = await getKeys() || {};
   if (!key) return {};
 
   try {
@@ -74,6 +78,41 @@ async function lookupTmdbMetadata(imdbId, tmdbId, mediaType) {
       }
     } else if (imdbId) {
       result.imdbId = imdbId;
+    }
+
+    // IMDB id may be an episode id (e.g. tt0752254), which `/find` cannot map.
+    // Bridge through OMDb (returns the parent seriesID) then TMDB `/find` on that
+    // series to get the series TMDB id + season/episode numbers.
+    if (mediaType === 'tv' && !result.tmdbId && imdbId && imdbId.startsWith('tt') && omdbApiKey) {
+      try {
+        const omdbRes = await fetch(
+          `https://www.omdbapi.com/?i=${encodeURIComponent(imdbId)}&apikey=${encodeURIComponent(omdbApiKey)}`,
+          { signal: AbortSignal.timeout(10000), agent: httpsAgent }
+        );
+        const omdb = await omdbRes.json();
+        if (omdb.Response === 'True' && omdb.Type === 'episode' && omdb.seriesID) {
+          const seriesImdb = omdb.seriesID;
+          const seriesRes = await fetch(
+            `https://api.themoviedb.org/3/find/${seriesImdb}?external_source=imdb_id&api_key=${key}`,
+            { signal: AbortSignal.timeout(10000), agent: httpsAgent }
+          );
+          const seriesData = await seriesRes.json();
+          const series = seriesData.tv_results?.[0];
+          if (series) {
+            result.tmdbId = series.id;
+            result.title = result.title || series.name || '';
+            result.year = result.year || (series.first_air_date || '').slice(0, 4);
+            result.imdbId = seriesImdb;
+            if (omdb.Season) result.season = parseInt(omdb.Season, 10) || undefined;
+            if (omdb.Episode) result.episode = parseInt(omdb.Episode, 10) || undefined;
+            console.log(`[TMDB] Episode ${imdbId} -> series ${series.name} (tmdb:${series.id} s${result.season}e${result.episode})`);
+          }
+        } else {
+          console.log(`[TMDB] OMDb: ${omdb.Response === 'True' ? 'not an episode' : 'no match'} for ${imdbId}`);
+        }
+      } catch (err) {
+        console.error(`[TMDB] Episode resolution failed:`, err.message);
+      }
     }
 
     // Fetch details — parallelize with find if we already have a tmdbId
@@ -226,12 +265,17 @@ async function resolveMovyStream(type, stremioId, season, episode) {
   const meta = await lookupTmdbMetadata(imdbId, tmdbId, mediaType);
   if (meta.tmdbId) tmdbId = meta.tmdbId;
 
+  // If metadata resolved a specific episode (episode IMDb id -> OMDb), prefer its
+  // season/episode numbers over whatever was parsed from the Stremio id.
+  const resolvedSeason = (meta.season != null) ? meta.season : season;
+  const resolvedEpisode = (meta.episode != null) ? meta.episode : episode;
+
   if (!tmdbId) {
     console.log('[Movy] Skipping: no TMDB ID available');
     return [];
   }
 
-  const cacheKey = `movy:${type}:${tmdbId}:${season}:${episode}`;
+  const cacheKey = `movy:${type}:${tmdbId}:${resolvedSeason}:${resolvedEpisode}`;
   const cached = streamCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) {
     console.log(`[Movy] Cached: ${cacheKey}`);
@@ -259,8 +303,8 @@ async function resolveMovyStream(type, stremioId, season, episode) {
         title: encodeURIComponent(meta.title || ''),
         mediaType,
         tmdbId: String(tmdbId),
-        seasonId: String(season || 1),
-        episodeId: String(episode || 1),
+        seasonId: String(resolvedSeason || 1),
+        episodeId: String(resolvedEpisode || 1),
         enc: '2',
         seed,
       });
@@ -289,7 +333,7 @@ async function resolveMovyStream(type, stremioId, season, episode) {
           return data.sources.map((src) => ({
             name: `Movy - ${server}${src.quality ? ' (' + src.quality + ')' : ''}`,
             title: `${server}${src.quality ? ' (' + src.quality + ')' : ''}`,
-            url: src.url,
+            url: `${getBaseUrl()}/proxy?url=${encodeURIComponent(src.url)}&referer=${encodeURIComponent(MOVY_BASE)}`,
           }));
         } catch (err) {
           console.log(`[Movy] ${server}: ${err.message}`);
@@ -370,6 +414,404 @@ builder.defineStreamHandler(async ({ type, id }) => {
 const addonInterface = builder.getInterface();
 const router = getRouter(addonInterface);
 
+// --- Proxy helpers ---
+// node-fetch 2.x cannot follow relative redirect Locations ("Only absolute
+// URLs are supported"), which 502s whole streams. Follow redirects manually.
+async function fetchWithRedirects(url, opts, maxHops = 5) {
+  let current = url;
+  for (let hop = 0; hop < maxHops; hop++) {
+    const res = await fetch(current, { ...opts, redirect: 'manual' });
+    const location = res.headers.get('location');
+    if (res.status >= 300 && res.status < 400 && location) {
+      current = new URL(location, current).toString();
+      continue;
+    }
+    return { response: res, finalUrl: current };
+  }
+  throw new Error('Too many redirects');
+}
+
+// --- Readahead cache ---
+// Upstream hosts throttle per connection (~320 KB/s), while Stremio's player
+// fetches sequentially with a small readahead. The movy.bz website stays
+// smooth because the browser opens several segment requests in parallel.
+// The proxy compensates: it caches media and prefetches ahead in parallel,
+// so sequential players get served from memory at LAN speed.
+// Small blocks keep the parallel pipeline flowing even when the upstream
+// throttles a single connection hard: several 1MB fetches finish quickly and
+// the pump always has the next chunk ready.
+const BLOCK_SIZE = 1 * 1024 * 1024;
+const READAHEAD_BLOCKS = 2;
+const READAHEAD_MAX_BYTES = 160 * 1024 * 1024;
+const MAX_RANGE_RESPONSE = 16 * 1024 * 1024;
+const HLS_PREFETCH = 2;
+// Small fast-start window so the player gets data immediately while the
+// first blocks prefetch in parallel.
+const PUMP_FAST_START = 512 * 1024;
+
+const mediaCache = new Map();
+let mediaCacheBytes = 0;
+const inflightPrefetch = new Set();
+const inflightFetches = new Map();  // key -> Promise<Buffer> (coalesces duplicate fetches)
+const playlistSegments = new Map(); // upstream playlist URL -> [segment URLs]
+const segmentPlaylist = new Map();  // segment URL -> upstream playlist URL
+const totalSizes = new Map();       // media URL -> total byte size
+const contentTypes = new Map();     // media URL -> upstream content-type
+
+function cacheGet(key) {
+  const entry = mediaCache.get(key);
+  if (!entry) return null;
+  entry.ts = Date.now();
+  return entry.buf;
+}
+
+function cachePut(key, buf) {
+  if (mediaCache.has(key)) return;
+  mediaCache.set(key, { buf, ts: Date.now() });
+  mediaCacheBytes += buf.length;
+  while (mediaCacheBytes > READAHEAD_MAX_BYTES) {
+    const oldestKey = mediaCache.keys().next().value;
+    const oldest = mediaCache.get(oldestKey);
+    mediaCacheBytes -= oldest.buf.length;
+    mediaCache.delete(oldestKey);
+  }
+}
+
+async function fetchRange(url, rangeHeader, referer) {
+  const agent = url.startsWith('https') ? httpsAgent : httpAgent;
+  const { response } = await fetchWithRedirects(url, {
+    headers: {
+      'User-Agent': UA,
+      'Referer': referer.endsWith('/') ? referer : referer + '/',
+      ...(rangeHeader ? { Range: rangeHeader } : {}),
+    },
+    agent,
+    // Hosts queue requests beyond their per-IP connection cap instead of
+    // rejecting them; without a timeout the pump would stall forever.
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!response.ok && response.status !== 206) throw new Error(`Upstream ${response.status}`);
+  return response;
+}
+
+// Single shared fetch per URL: concurrent client requests and prefetches
+// for the same resource coalesce into one upstream connection.
+function fetchBufferCoalesced(key, url, rangeHeader, referer) {
+  if (inflightFetches.has(key)) return inflightFetches.get(key);
+  const p = fetchRange(url, rangeHeader, referer)
+    .then(async (res) => {
+      let buf = await res.buffer();
+      const ct = res.headers.get('content-type');
+      if (ct && !ct.includes('html')) contentTypes.set(url, ct);
+      const cr = res.headers.get('content-range');
+      if (cr) {
+        const total = parseInt(cr.split('/')[1], 10);
+        if (!isNaN(total)) totalSizes.set(url, total);
+      }
+      if (rangeHeader && res.status === 200 && !cr) {
+        // Upstream ignored Range and returned the whole file — slice it.
+        const cl = parseInt(res.headers.get('content-length'), 10);
+        if (!isNaN(cl)) totalSizes.set(url, cl);
+        const m = /bytes=(\d+)-(\d*)/.exec(rangeHeader);
+        if (m) {
+          const s = parseInt(m[1], 10);
+          const e = m[2] ? parseInt(m[2], 10) : buf.length - 1;
+          buf = Buffer.from(buf.subarray(s, Math.min(e + 1, buf.length)));
+        }
+      }
+      cachePut(key, buf);
+      inflightFetches.delete(key);
+      return buf;
+    })
+    .catch((err) => {
+      inflightFetches.delete(key);
+      throw err;
+    });
+  inflightFetches.set(key, p);
+  return p;
+}
+
+function registerPlaylist(playlistUrl, segmentUrls) {
+  playlistSegments.set(playlistUrl, segmentUrls);
+  for (const seg of segmentUrls) segmentPlaylist.set(seg, playlistUrl);
+}
+
+// Upstream hosts label segments inconsistently (mpegurl, text/html); the
+// player sniffs anyway, but pick a correct type from the extension for
+// players that trust the header (e.g. Stremio web / hls.js).
+function segmentContentType(url) {
+  if (/\.ts(\?|$)/i.test(url)) return 'video/mp2t';
+  if (/\.(m4s|mp4)(\?|$)/i.test(url)) return 'video/iso.segment';
+  if (/\.aac(\?|$)/i.test(url)) return 'audio/aac';
+  return null;
+}
+
+function scheduleHlsPrefetch(segUrl, referer) {
+  const list = playlistSegments.get(segmentPlaylist.get(segUrl));
+  if (!list) return;
+  const idx = list.indexOf(segUrl);
+  if (idx === -1) return;
+  for (let n = 1; n <= HLS_PREFETCH; n++) {
+    const next = list[idx + n];
+    if (!next || cacheGet(next) || inflightPrefetch.has(next)) continue;
+    inflightPrefetch.add(next);
+    fetchBufferCoalesced(next, next, null, referer)
+      .catch(() => {})
+      .finally(() => inflightPrefetch.delete(next));
+  }
+}
+
+function scheduleInitialPrefetch(playlistUrl, referer) {
+  const list = playlistSegments.get(playlistUrl);
+  if (!list || list.length === 0) return;
+  const first = list[0];
+  if (!cacheGet(first) && !inflightPrefetch.has(first)) {
+    inflightPrefetch.add(first);
+    fetchBufferCoalesced(first, first, null, referer)
+      .catch(() => {})
+      .finally(() => inflightPrefetch.delete(first));
+  }
+}
+
+async function getBlock(url, blockIndex, referer) {
+  const key = `${url}#b${blockIndex}`;
+  const hit = cacheGet(key);
+  if (hit) return hit;
+  const start = blockIndex * BLOCK_SIZE;
+  let buf = null;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2 && !buf; attempt++) {
+    try {
+      buf = await fetchBufferCoalesced(key, url, `bytes=${start}-${start + BLOCK_SIZE - 1}`, referer);
+    } catch (err) {
+      lastErr = err;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+  if (!buf) throw lastErr || new Error('block fetch failed');
+  if (start + buf.length < (blockIndex + 1) * BLOCK_SIZE) {
+    // short response = upstream EOF
+    totalSizes.set(url, start + buf.length);
+  }
+  return cacheGet(key) || buf;
+}
+
+async function serveRangeFromCache(req, res, targetUrl, referer) {
+  const match = /^bytes=(\d*)-(\d*)/.exec(req.headers.range);
+  const start = match && match[1] ? parseInt(match[1], 10) : 0;
+  let end = match && match[2] ? parseInt(match[2], 10) : NaN;
+  let total = totalSizes.get(targetUrl) || null;
+
+  if (isNaN(end)) {
+    if (total == null) {
+      try {
+        const probe = await fetchRange(targetUrl, `bytes=${start}-${start}`, referer);
+        const cr = probe.headers.get('content-range');
+        if (cr) {
+          const t = parseInt(cr.split('/')[1], 10);
+          if (!isNaN(t)) { total = t; totalSizes.set(targetUrl, t); }
+        }
+      } catch (err) { /* probe failed; cap response below */ }
+    }
+    if (total != null && start >= total) {
+      res.writeHead(416, { 'Content-Range': `bytes */${total}` });
+      res.end();
+      return;
+    }
+    end = total != null ? Math.min(total - 1, start + MAX_RANGE_RESPONSE - 1) : start + MAX_RANGE_RESPONSE - 1;
+  }
+
+  const chunks = [];
+  let served = 0;
+  const blockIndexes = [];
+  for (let bi = Math.floor(start / BLOCK_SIZE); bi * BLOCK_SIZE <= end; bi++) blockIndexes.push(bi);
+  // Fetch the needed blocks in parallel (coalescing prevents duplicates)
+  const blocks = await Promise.all(blockIndexes.map((bi) => getBlock(targetUrl, bi, referer).catch(() => null)));
+  for (let i = 0; i < blockIndexes.length; i++) {
+    const bi = blockIndexes[i];
+    const block = blocks[i];
+    if (!block) break;
+    const bStart = Math.max(start, bi * BLOCK_SIZE);
+    const bEnd = Math.min(end, (bi + 1) * BLOCK_SIZE - 1);
+    const from = bStart - bi * BLOCK_SIZE;
+    const to = Math.min(bEnd - bi * BLOCK_SIZE + 1, block.length);
+    if (to <= from) break; // upstream EOF
+    chunks.push(block.subarray(from, to));
+    served += to - from;
+    if (to - from < bEnd - bStart + 1) { // upstream EOF inside this block
+      totalSizes.set(targetUrl, bi * BLOCK_SIZE + block.length);
+      total = bi * BLOCK_SIZE + block.length;
+      break;
+    }
+  }
+
+  const lastBlock = Math.floor((start + served - 1) / BLOCK_SIZE);
+  for (let n = 1; n <= READAHEAD_BLOCKS; n++) {
+    const bi = lastBlock + n;
+    const key = `${targetUrl}#b${bi}`;
+    if (total != null && bi * BLOCK_SIZE >= total) break;
+    if (!cacheGet(key) && !inflightPrefetch.has(key)) {
+      inflightPrefetch.add(key);
+      getBlock(targetUrl, bi, referer).catch(() => {}).finally(() => inflightPrefetch.delete(key));
+    }
+  }
+
+  const headers = {
+    'Content-Type': contentTypes.get(targetUrl) || 'video/mp4',
+    'Accept-Ranges': 'bytes',
+    'Content-Length': served,
+    'Content-Range': `bytes ${start}-${start + served - 1}/${total != null ? total : '*'}`,
+    'Cache-Control': 'no-cache',
+  };
+  res.writeHead(206, headers);
+  res.end(Buffer.concat(chunks));
+}
+
+function scheduleBlockPrefetch(url, fromBlock, count, referer, total) {
+  for (let n = 0; n < count; n++) {
+    const bi = fromBlock + n;
+    const key = `${url}#b${bi}`;
+    if (total != null && bi * BLOCK_SIZE >= total) break;
+    if (!cacheGet(key) && !inflightPrefetch.has(key)) {
+      inflightPrefetch.add(key);
+      getBlock(url, bi, referer).catch(() => {}).finally(() => inflightPrefetch.delete(key));
+    }
+  }
+}
+
+function drain(res) {
+  return new Promise((resolve) => res.once('drain', resolve));
+}
+
+// Progressive stream for open-ended ("bytes=N-") or range-less MP4 requests.
+// The upstream throttles a single connection below the bitrate Stremio's
+// player expects, so beyond a small fast-start window the file is pumped
+// block-by-block while the next blocks download in parallel.
+async function pumpOpenEnded(req, res, targetUrl, start, referer) {
+  const hasRange = !!req.headers.range;
+  let total = totalSizes.get(targetUrl) || null;
+  if (total == null) {
+    try {
+      const probe = await fetchRange(targetUrl, `bytes=${start}-${start}`, referer);
+      if (probe.status === 200 && !probe.headers.get('content-range')) {
+        // Upstream ignores Range — fall back to a plain stream of the file.
+        const ct = probe.headers.get('content-type');
+        if (ct && !ct.includes('html')) contentTypes.set(targetUrl, ct);
+        res.writeHead(200, { 'Content-Type': ct || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+        probe.body.pipe(res);
+        probe.body.on('error', () => res.destroy());
+        return;
+      }
+      const cr = probe.headers.get('content-range');
+      if (cr) {
+        const t = parseInt(cr.split('/')[1], 10);
+        if (!isNaN(t)) { total = t; totalSizes.set(targetUrl, t); }
+      }
+    } catch (err) { /* total stays unknown */ }
+  }
+  if (total != null && start >= total) {
+    res.writeHead(416, { 'Content-Range': `bytes */${total}` });
+    res.end();
+    return;
+  }
+
+  const headers = {
+    'Content-Type': contentTypes.get(targetUrl) || 'video/mp4',
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-cache',
+  };
+  if (hasRange) {
+    headers['Content-Range'] = `bytes ${start}-${total != null ? total - 1 : ''}/${total != null ? total : '*'}`;
+    res.writeHead(206, headers);
+  } else {
+    if (total != null) headers['Content-Length'] = total - start;
+    res.writeHead(200, headers);
+  }
+
+  // Fast start: pipe the first window straight from its own upstream
+  // connection so the player gets data immediately.
+  const hardEnd = total != null ? total - 1 : start + PUMP_FAST_START - 1;
+  const fastEnd = Math.min(start + PUMP_FAST_START - 1, hardEnd);
+  scheduleBlockPrefetch(targetUrl, Math.floor(fastEnd / BLOCK_SIZE), READAHEAD_BLOCKS + 1, referer, total);
+
+  let cursor = start;
+  try {
+    if (fastEnd >= start) {
+      const response = await fetchRange(targetUrl, `bytes=${start}-${fastEnd}`, referer);
+      const abort = () => response.body.destroy();
+      res.on('close', abort);
+      if (response.status === 200 && !response.headers.get('content-range')) {
+        // Inconsistent upstream: pipe the whole file to completion.
+        response.body.pipe(res);
+        response.body.on('error', () => res.destroy());
+        res.off('close', abort);
+        return;
+      }
+      await new Promise((resolve, reject) => {
+        response.body.on('error', reject);
+        response.body.on('end', resolve);
+        response.body.pipe(res, { end: false });
+      });
+      res.off('close', abort);
+      const cr = response.headers.get('content-range');
+      if (cr) {
+        const t = parseInt(cr.split('/')[1], 10);
+        if (!isNaN(t)) { total = t; totalSizes.set(targetUrl, t); }
+      }
+      cursor = fastEnd + 1;
+    }
+
+    // Continue from the block cache, keeping parallel prefetches running.
+    while (!res.destroyed && !res.writableEnded) {
+      if (total != null && cursor >= total) break;
+      const bi = Math.floor(cursor / BLOCK_SIZE);
+      const block = await getBlock(targetUrl, bi, referer);
+      const from = cursor - bi * BLOCK_SIZE;
+      if (from >= block.length) {
+        totalSizes.set(targetUrl, bi * BLOCK_SIZE + block.length);
+        break;
+      }
+      const slice = block.subarray(from, Math.min(total != null ? total - bi * BLOCK_SIZE : block.length, block.length));
+      if (!res.write(slice)) await drain(res);
+      cursor += slice.length;
+      scheduleBlockPrefetch(targetUrl, bi + 1, READAHEAD_BLOCKS, referer, total);
+    }
+    res.end();
+  } catch (err) {
+    if (!res.headersSent) throw err;
+    res.destroy();
+  }
+}
+
+// Rewrite an HLS playlist body: every entry is resolved against the upstream
+// playlist URL and routed back through the proxy. Used for both .m3u8 URLs
+// and extension-less playlists (sniffed via the #EXTM3U header at serve time).
+function rewritePlaylist(body, playlistUrl, req, referer) {
+  const baseProxy = `${getBaseUrl(req)}/proxy?referer=${encodeURIComponent(referer)}&url=`;
+  const toProxy = (raw) => {
+    try {
+      return baseProxy + encodeURIComponent(new URL(raw, playlistUrl).toString());
+    } catch (err) {
+      return raw;
+    }
+  };
+  const segmentUrls = [];
+  const rewritten = body.split('\n').map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return line;
+    if (trimmed.startsWith('#')) {
+      // Rewrite URI="..." attributes (variant playlists, keys, init maps)
+      return line.replace(/URI="([^"]+)"/g, (m, uri) => `URI="${toProxy(uri)}"`);
+    }
+    try {
+      const abs = new URL(trimmed, playlistUrl).toString();
+      if (!/\.m3u8(\?|$)/i.test(abs)) segmentUrls.push(abs);
+    } catch (err) { /* leave unrewritten lines as-is */ }
+    return toProxy(trimmed);
+  }).join('\n');
+  return { rewritten, segmentUrls };
+}
+
 router.get('/proxy', async (req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const targetUrl = parsedUrl.searchParams.get('url');
@@ -381,7 +823,60 @@ router.get('/proxy', async (req, res) => {
     return;
   }
 
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Content-Type');
+
+  const isKnownSegment = segmentPlaylist.has(targetUrl);
+
   try {
+    // Cached HLS segment — serve from memory immediately, keep prefetching ahead
+    if (isKnownSegment) {
+      const cached = cacheGet(targetUrl);
+      if (cached) {
+        // Extension-less playlists can be misregistered as segments; sniff
+        // for the playlist header and rewrite them instead of serving raw.
+        if (cached.subarray(0, 7).toString('latin1') === '#EXTM3U') {
+          segmentPlaylist.delete(targetUrl);
+          const { rewritten, segmentUrls } = rewritePlaylist(cached.toString('utf8'), targetUrl, req, referer);
+          registerPlaylist(targetUrl, segmentUrls);
+          scheduleInitialPrefetch(targetUrl, referer);
+          res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' });
+          res.end(rewritten);
+          return;
+        }
+        const match = req.headers.range ? /^bytes=(\d+)-(\d*)/.exec(req.headers.range) : null;
+        const body = match ? cached.subarray(parseInt(match[1], 10), match[2] ? parseInt(match[2], 10) + 1 : undefined) : cached;
+        const headers = {
+          'Content-Type': segmentContentType(targetUrl) || contentTypes.get(targetUrl) || 'application/octet-stream',
+          'Content-Length': body.length,
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'no-cache',
+        };
+        if (match) headers['Content-Range'] = `bytes ${parseInt(match[1], 10)}-${parseInt(match[1], 10) + body.length - 1}/${cached.length}`;
+        res.writeHead(match ? 206 : 200, headers);
+        res.end(body);
+        scheduleHlsPrefetch(targetUrl, referer);
+        return;
+      }
+    }
+
+    // Media requests (MP4 etc.) — served through the parallel block cache.
+    // Playlists are excluded: they must go through the rewrite path below.
+    const looksLikeM3u8 = /\.m3u8(\?|$)/i.test(targetUrl);
+    if (!isKnownSegment && !looksLikeM3u8 && req.method === 'GET') {
+      const range = req.headers.range;
+      const closedRange = range && /^bytes=\d+-\d+\s*$/.test(range.trim());
+      if (closedRange) {
+        await serveRangeFromCache(req, res, targetUrl, referer);
+      } else {
+        const start = range ? parseInt(/^bytes=(\d+)/.exec(range)[1], 10) : 0;
+        await pumpOpenEnded(req, res, targetUrl, start, referer);
+      }
+      return;
+    }
+
     const proxyHeaders = {
       'User-Agent': UA,
       'Referer': referer.endsWith('/') ? referer : referer + '/',
@@ -389,12 +884,7 @@ router.get('/proxy', async (req, res) => {
     if (req.headers.range) proxyHeaders['Range'] = req.headers.range;
 
     const agent = targetUrl.startsWith('https') ? httpsAgent : httpAgent;
-    const response = await fetch(targetUrl, { headers: proxyHeaders, redirect: 'follow', agent });
-
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Range');
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Content-Type');
+    const { response, finalUrl } = await fetchWithRedirects(targetUrl, { headers: proxyHeaders, agent });
 
     const contentType = response.headers.get('content-type') || '';
     const contentLength = response.headers.get('content-length');
@@ -403,12 +893,45 @@ router.get('/proxy', async (req, res) => {
     const isM3u8 = targetUrl.includes('.m3u8') || contentType.includes('mpegurl');
 
     if (isM3u8) {
+      if (!response.ok) {
+        res.writeHead(response.status, { 'Content-Type': 'text/plain' });
+        res.end(`Upstream playlist error: ${response.status}`);
+        return;
+      }
       const body = await response.text();
-      const baseProxy = `${getBaseUrl(req)}/proxy?referer=${encodeURIComponent(referer)}&url=`;
-      let rewritten = body.replace(/^(https?:\/\/\S+)$/gm, (line) => baseProxy + encodeURIComponent(line));
-      rewritten = rewritten.replace(/URI="(https?:\/\/[^"\s]+)"/g, (match, url) => `URI="${baseProxy + encodeURIComponent(url)}"`);
+      const playlistUrl = finalUrl || targetUrl;
+      const { rewritten, segmentUrls } = rewritePlaylist(body, playlistUrl, req, referer);
+      registerPlaylist(playlistUrl, segmentUrls);
+      scheduleInitialPrefetch(playlistUrl, referer);
       res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' });
       res.end(rewritten);
+      return;
+    }
+
+    if (isKnownSegment) {
+      // Uncached HLS segment — one coalesced upstream fetch, cached for
+      // replay, then prefetch the next segments in parallel.
+      const buf = await fetchBufferCoalesced(targetUrl, targetUrl, null, referer);
+      // Extension-less playlists get registered as segments — sniff and
+      // rewrite them instead of serving raw.
+      if (buf.subarray(0, 7).toString('latin1') === '#EXTM3U') {
+        segmentPlaylist.delete(targetUrl);
+        const { rewritten, segmentUrls } = rewritePlaylist(buf.toString('utf8'), targetUrl, req, referer);
+        registerPlaylist(targetUrl, segmentUrls);
+        scheduleInitialPrefetch(targetUrl, referer);
+        res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' });
+        res.end(rewritten);
+        return;
+      }
+      const headers = {
+        'Content-Type': segmentContentType(targetUrl) || contentTypes.get(targetUrl) || 'application/octet-stream',
+        'Content-Length': buf.length,
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'no-cache',
+      };
+      res.writeHead(200, headers);
+      res.end(buf);
+      scheduleHlsPrefetch(targetUrl, referer);
       return;
     }
 
