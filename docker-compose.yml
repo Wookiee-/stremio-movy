@@ -3,46 +3,15 @@ services:
     build: .
     container_name: movy
     restart: unless-stopped
-    expose:
-      - "7000"
+    ports:
+      - "127.0.0.1:7000:7000"
     environment:
       - PORT=7000
       # optional: uncomment and set your own keys to avoid freekeys rate limits
       # - TMDB_API_KEY=${TMDB_API_KEY}
       # - OMDB_API_KEY=${OMDB_API_KEY}
-    networks:
-      - web
+    # no networks/volumes needed - host nginx proxies to 127.0.0.1:7000
 
-  nginx:
-    image: nginx:alpine
-    container_name: movy-nginx
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx/movy.conf:/etc/nginx/conf.d/default.conf:ro
-      - certbot_certs:/etc/letsencrypt:ro
-      - certbot_www:/var/www/certbot:ro
-    depends_on:
-      - movy
-    networks:
-      - web
-
-  # certbot runs `certbot renew` every 12h + reloads nginx on success
-  certbot:
-    image: certbot/certbot
-    container_name: movy-certbot
-    volumes:
-      - certbot_certs:/etc/letsencrypt
-      - certbot_www:/var/www/certbot
-    # renew loop + nginx reload via docker socket (optional) — default just renews
-    entrypoint: >
-      sh -c "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot; sleep 12h & wait $${!}; done"
-
-volumes:
-  certbot_certs:
-  certbot_www:
-
-networks:
-  web:
+# Host nginx handles TLS (see nginx/movy.conf + setup-nginx.sh)
+#   proxy_pass http://127.0.0.1:7000;
+#   sudo certbot --nginx -d movy.ddns.net
