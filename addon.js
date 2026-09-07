@@ -1008,8 +1008,8 @@ router.options('/proxy', (req, res) => {
 router.get('/', (req, res) => {
   const baseUrl = getBaseUrl(req);
   const installUrl = `stremio://${req.headers.host || '127.0.0.1:' + PORT}/manifest.json`;
-  res.setHeader('Content-Type', 'text/html');
-  res.send(`<!DOCTYPE html>
+  res.writeHead(200, { 'Content-Type': 'text/html' });
+  res.end(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
