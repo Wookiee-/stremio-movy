@@ -337,11 +337,10 @@ async function resolveMovyStream(type, stremioId, season, episode) {
           if (!data.sources || data.sources.length === 0) return [];
           console.log(`[Movy] ${server}: ${data.sources.length} source(s)`);
 
-          const direct = process.env.DIRECT_STREAMS === 'true' || process.env.DIRECT === 'true';
           return data.sources.map((src) => ({
             name: `Movy - ${server}${src.quality ? ' (' + src.quality + ')' : ''}`,
             title: `${server}${src.quality ? ' (' + src.quality + ')' : ''}`,
-            url: direct ? src.url : `${getBaseUrl()}/proxy?url=${encodeURIComponent(src.url)}&referer=${encodeURIComponent(MOVY_BASE)}`,
+            url: `${getBaseUrl()}/proxy?url=${encodeURIComponent(src.url)}&referer=${encodeURIComponent(MOVY_BASE)}`,
           }));
         } catch (err) {
           console.log(`[Movy] ${server}: ${err.message}`);
