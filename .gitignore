@@ -4,3 +4,6 @@ server.log
 node_modules/
 server-test.log
 *.log
+__pycache__/
+.venv/
+.pytest_cache/

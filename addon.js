@@ -479,19 +479,32 @@ function cachePut(key, buf) {
 
 async function fetchRange(url, rangeHeader, referer) {
   const agent = url.startsWith('https') ? httpsAgent : httpAgent;
-  const { response } = await fetchWithRedirects(url, {
-    headers: {
-      'User-Agent': UA,
-      'Referer': referer.endsWith('/') ? referer : referer + '/',
-      ...(rangeHeader ? { Range: rangeHeader } : {}),
-    },
-    agent,
-    // Hosts queue requests beyond their per-IP connection cap instead of
-    // rejecting them; without a timeout the pump would stall forever.
-    signal: AbortSignal.timeout(20000),
-  });
-  if (!response.ok && response.status !== 206) throw new Error(`Upstream ${response.status}`);
-  return response;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { response } = await fetchWithRedirects(url, {
+      headers: {
+        'User-Agent': UA,
+        'Referer': referer.endsWith('/') ? referer : referer + '/',
+        ...(rangeHeader ? { Range: rangeHeader } : {}),
+      },
+      agent,
+      signal: AbortSignal.timeout(20000),
+    });
+    if (response.status === 429) {
+      // silent backoff — don't spam logs, just respect Retry-After
+      if (attempt < 2) {
+        const ra = parseInt(response.headers.get('retry-after') || '1', 10);
+        const delay = Math.min(Math.max(isNaN(ra) ? 1 : ra, 1) * 1000, 5000) * (attempt + 1);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      const err = new Error('Upstream 429');
+      err.statusCode = 429;
+      err.retryAfter = response.headers.get('retry-after') || '2';
+      throw err;
+    }
+    if (!response.ok && response.status !== 206) throw new Error(`Upstream ${response.status}`);
+    return response;
+  }
 }
 
 // Single shared fetch per URL: concurrent client requests and prefetches
@@ -944,7 +957,7 @@ router.get('/proxy', async (req, res) => {
     if (response.body && typeof response.body.pipe === 'function') {
       response.body.pipe(res);
       response.body.on('error', (err) => {
-        console.error(`[Proxy] Stream error: ${err.message}`);
+        if (!String(err.message).includes('429')) console.error(`[Proxy] Stream error: ${err.message}`);
         res.destroy();
       });
     } else {
@@ -953,9 +966,24 @@ router.get('/proxy', async (req, res) => {
       res.end(buf);
     }
   } catch (err) {
+    const is429 = err.statusCode === 429 || String(err.message).includes('429');
+    if (is429) {
+      // silent — don't spam logs, return 429 so Stremio/player backs off
+      if (!res.headersSent) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': err.retryAfter || '2' });
+        res.end(JSON.stringify({ error: 'Upstream rate limited', retryAfter: err.retryAfter || '2' }));
+      } else {
+        res.destroy();
+      }
+      return;
+    }
     console.error(`[Proxy] Error: ${err.message}`);
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Proxy error', message: err.message }));
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Proxy error', message: err.message }));
+    } else {
+      res.destroy();
+    }
   }
 });
 
