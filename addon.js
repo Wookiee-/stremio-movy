@@ -19,9 +19,16 @@ const MOVY_SERVERS = ['miami', 'seattle', 'denver', 'atlanta', 'phoenix', 'portl
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36';
 
 // Dynamic base URL — works on Vercel, local dev, or any host
+// For host nginx + Docker, set BASE_URL=https://movy.ddns.net so stream URLs
+// don't fallback to 127.0.0.1 (stream handler has no req context)
 function getBaseUrl(req) {
+  if (process.env.BASE_URL) return process.env.BASE_URL.replace(/\/$/, '');
+  if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/$/, '');
   if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
-  if (req && req.headers && req.headers.host) return `http://${req.headers.host}`;
+  if (req && req.headers && req.headers.host) {
+    const proto = (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() || 'http';
+    return `${proto}://${req.headers.host}`;
+  }
   return `http://127.0.0.1:${PORT}`;
 }
 
