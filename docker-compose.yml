@@ -1,18 +1,22 @@
 services:
   movy:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.python
     container_name: movy
     restart: unless-stopped
     ports:
       - "127.0.0.1:7000:7000"
     environment:
       - PORT=7000
-      - BASE_URL=https://movy.ddns.net
+      - HOST=0.0.0.0
       # optional: uncomment and set your own keys to avoid freekeys rate limits
       # - TMDB_API_KEY=${TMDB_API_KEY}
       # - OMDB_API_KEY=${OMDB_API_KEY}
     # no networks/volumes needed - host nginx proxies to 127.0.0.1:7000
+    # Python direct: returns src.url + proxyHeaders (like debrid), VPS only scrapes, 0 video bandwidth
 
 # Host nginx handles TLS (see nginx/movy.conf + setup-nginx.sh)
 #   proxy_pass http://127.0.0.1:7000;
 #   sudo certbot --nginx -d movy.ddns.net
+# Node proxied alternative: change dockerfile to Dockerfile

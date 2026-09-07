@@ -126,7 +126,7 @@ async def index(request: Request):
 if __name__ == "__main__":
     from granian import Granian
 
-    host = "127.0.0.1"
+    host = config.HOST
     port = config.PORT
     log.info("serving with Granian on http://%s:%s", host, port)
     Granian("app.main:app", interface="asgi", address=host, port=port).serve()
