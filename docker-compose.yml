@@ -8,10 +8,12 @@ services:
     environment:
       - PORT=7000
       - BASE_URL=https://movy.ddns.net
+      - DIRECT_STREAMS=true
       # optional: uncomment and set your own keys to avoid freekeys rate limits
       # - TMDB_API_KEY=${TMDB_API_KEY}
       # - OMDB_API_KEY=${OMDB_API_KEY}
     # no networks/volumes needed - host nginx proxies to 127.0.0.1:7000
+    # DIRECT_STREAMS=true = VPS only scrapes (api.wecollege.net/TMDB), video goes direct client->upstream (saves VPS bandwidth)
 
 # Host nginx handles TLS (see nginx/movy.conf + setup-nginx.sh)
 #   proxy_pass http://127.0.0.1:7000;
