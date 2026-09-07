@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+.vercel
+.pytest_cache
+.env.local
+server-test.log
+tests
+README.md
