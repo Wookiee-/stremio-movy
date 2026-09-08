@@ -3,7 +3,6 @@ import asyncio
 import json
 import logging
 import random
-import re
 import time
 from urllib.parse import quote, urlencode
 
@@ -230,44 +229,18 @@ async def lookup_tmdb_metadata(
         return result
 
 
-def _quality_rank(q: str | None) -> int:
-    if not q:
-        return 0
-    q = q.lower()
-    if "2160" in q or "4k" in q:
-        return 4000
-    if "1080" in q:
-        return 3000
-    if "720" in q:
-        return 2000
-    if "480" in q:
-        return 1000
-    if "360" in q:
-        return 500
-    try:
-        return int(re.search(r"\d+", q).group())  # type: ignore
-    except Exception:
-        return 0
-
-
-def _build_stream(server: str, quality: str | None, src_url: str, base_url: str | None = None) -> dict:
+def _build_stream(server: str, quality: str | None, src_url: str) -> dict:
     label = f"{server}" + (f" ({quality})" if quality else "")
-    # proxied HLS/MP4 via FastAPI /proxy (readahead) — same as Node addon.js
-    if base_url:
-        proxied = f"{base_url.rstrip('/')}/proxy?url={quote(src_url, safe='')}&referer={quote(config.MOVY_BASE, safe='')}"
-        url = proxied
-        behavior = {"bingeGroup": f"movy-{quality or 'auto'}"}
-    else:
-        url = src_url
-        behavior = {
-            "bingeGroup": f"movy-{quality or server}",
-            "proxyHeaders": {"request": {"Referer": config.MOVY_BASE + "/", "User-Agent": config.UA}},
-        }
     return {
         "name": f"Movy {label}",
         "title": label,
-        "url": url,
-        "behaviorHints": behavior,
+        "url": src_url,
+        "behaviorHints": {
+            "bingeGroup": f"movy-{quality or server}",
+            # Stremio forwards these headers with the direct request,
+            # so upstream Referer checks pass without proxying.
+            "proxyHeaders": {"request": {"Referer": config.MOVY_BASE + "/", "User-Agent": config.UA}},
+        },
     }
 
 
@@ -313,7 +286,6 @@ async def resolve_movy_streams(
     stremio_id: str,
     season: int = 1,
     episode: int = 1,
-    base_url: str | None = None,
 ) -> list[dict]:
     media_type = "movie" if type_ == "movie" else "tv"
     tmdb_id = extract_tmdb_id(stremio_id)
@@ -331,7 +303,7 @@ async def resolve_movy_streams(
         log.info("skipping: no TMDB id")
         return []
 
-    cache_key = f"movy:{type_}:{tmdb_id}:{season}:{episode}:{base_url or 'direct'}"
+    cache_key = f"movy:{type_}:{tmdb_id}:{season}:{episode}"
     async with _cache_lock:
         hit = _stream_cache.get(cache_key)
         if hit and time.time() - hit[0] < config.CACHE_TTL:
@@ -384,31 +356,13 @@ async def resolve_movy_streams(
                 params["imdbId"] = str(meta["imdbId"])
             query = urlencode(params)
 
-            # stagger 8 servers slightly to avoid thundering-herd 429s (like Node)
-            # launch with 50ms jitter between servers
-            async def _gather_staggered():
-                tasks = []
-                for i, s in enumerate(config.MOVY_SERVERS):
-                    if i:
-                        await asyncio.sleep(0.05)
-                    tasks.append(asyncio.create_task(_fetch_server(client, s, query, str(tmdb_id), seed)))
-                return await asyncio.gather(*tasks)
-
-            results = await _gather_staggered()
+            results = await asyncio.gather(
+                *(_fetch_server(client, s, query, str(tmdb_id), seed) for s in config.MOVY_SERVERS)
+            )
             streams: list[dict] = []
-            seen: set[str] = set()
-            tmp: list[tuple[int, dict]] = []
             for server, sources in zip(config.MOVY_SERVERS, results):
                 for src in sources:
-                    url = src.get("url", "")
-                    if not url or url in seen:
-                        continue
-                    seen.add(url)
-                    quality = src.get("quality")
-                    tmp.append((_quality_rank(quality), _build_stream(server, quality, url, base_url)))
-            # highest quality first — player picks first entry
-            tmp.sort(key=lambda x: x[0], reverse=True)
-            streams = [s for _, s in tmp]
+                    streams.append(_build_stream(server, src.get("quality"), src.get("url", "")))
             async with _cache_lock:
                 _stream_cache[cache_key] = (time.time(), streams)
             return streams

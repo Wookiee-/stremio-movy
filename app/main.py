@@ -1,4 +1,4 @@
-"""Stremio Movy addon — FastAPI + Granian + httpx[http2], proxied HLS + direct fallback."""
+"""Stremio Movy addon — FastAPI + Granian + httpx[http2], direct streams only."""
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -10,7 +10,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import config
 from .movy import parse_stremio_id, resolve_movy_streams
-from . import proxy as proxy_module
 
 log = logging.getLogger("addon")
 logging.basicConfig(level=logging.INFO)
@@ -20,9 +19,9 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 MANIFEST = {
     "id": "community.movy",
-    "version": "1.2.0",
+    "version": "1.1.0",
     "name": "Movy Stream",
-    "description": "Provides streams from Movy.bz — proxied HLS with readahead (FastAPI + Granian + HTTP/2, fixes upstream throttle buffering)",
+    "description": "Provides direct streams from Movy.bz for movies and TV shows (FastAPI + Granian + HTTP/2)",
     "catalogs": [],
     "resources": ["stream"],
     "types": ["movie", "series"],
@@ -35,12 +34,11 @@ _client_loop: object | None = None
 
 
 def _make_client() -> httpx.AsyncClient:
-    # tuned for proxied HLS: more burst conn, fewer idle keepalives, tighter timeouts
-    limits = httpx.Limits(max_connections=128, max_keepalive_connections=32)
+    limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
     return httpx.AsyncClient(
         http2=True,  # HTTP/2 where supported, HTTP/1.1 fallback otherwise
         limits=limits,
-        timeout=httpx.Timeout(10.0, connect=4.0, read=20.0, write=10.0, pool=5.0),
+        timeout=httpx.Timeout(15.0, read=30.0),
         headers={"User-Agent": config.UA},
         follow_redirects=True,
     )
@@ -75,9 +73,7 @@ app = FastAPI(title="Movy Stream", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "HEAD", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["Content-Range", "Content-Length", "Content-Type", "Accept-Ranges"],
+    allow_methods=["GET"],
 )
 
 
@@ -104,30 +100,9 @@ async def stream(type_: str, video_id: str, request: Request):
     clean_id, season, episode = parse_stremio_id(type_, video_id)
     log.info("stream request: type=%s id=%s -> %s s=%s e=%s", type_, video_id, clean_id, season, episode)
     client = await _ensure_client()
-    base = _base_url(request)
-    streams = await resolve_movy_streams(client, type_, clean_id, season, episode, base_url=base)
-    log.info("returning %d proxied stream(s)", len(streams))
+    streams = await resolve_movy_streams(client, type_, clean_id, season, episode)
+    log.info("returning %d direct stream(s)", len(streams))
     return JSONResponse({"streams": streams})
-
-
-@app.get("/proxy")
-@app.head("/proxy")
-async def proxy(request: Request):
-    client = await _ensure_client()
-    return await proxy_module.handle_proxy(request, client)
-
-
-@app.options("/proxy")
-async def proxy_options():
-    return JSONResponse(
-        {},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-            "Access-Control-Allow-Headers": "Range",
-            "Access-Control-Expose-Headers": "Content-Range, Content-Length, Content-Type",
-        },
-    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -141,9 +116,9 @@ async def index(request: Request):
 <style>*{{margin:0;padding:0;box-sizing:border-box}}body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;display:flex;align-items:center;justify-content:center}}.container{{max-width:600px;padding:40px;text-align:center}}h1{{font-size:2.5rem;margin-bottom:10px;color:#7b2ff7}}.subtitle{{color:#aaa;margin-bottom:30px;font-size:1.1rem}}.card{{background:#16213e;border-radius:12px;padding:30px;margin-bottom:20px}}.install-btn{{display:inline-block;background:#7b2ff7;color:white;text-decoration:none;padding:14px 32px;border-radius:8px;font-size:1.1rem;font-weight:600}}code{{background:#0f3460;padding:2px 8px;border-radius:4px}}</style>
 </head><body><div class="container">
 <h1>&#9654; Movy Stream</h1>
-<p class="subtitle">FastAPI + Granian + HTTP/2 &middot; proxied HLS with readahead</p>
+<p class="subtitle">FastAPI + Granian + HTTP/2 &middot; direct streams</p>
 <div class="card"><a href="{install}" class="install-btn">Install in Stremio</a>
-<p style="color:#888;margin-top:15px">Proxied HLS + MP4 with 1MB block cache & parallel prefetch — hides upstream 320KB/s throttle for smooth playback.</p></div>
+<p style="color:#888;margin-top:15px">Direct upstream URLs with Referer via proxyHeaders &mdash; no server bandwidth.</p></div>
 <div class="card"><h3>Manual install</h3><p><code>{base}/manifest.json</code></p></div>
 </div></body></html>""")
 
