@@ -35,8 +35,7 @@ The server will start at `http://127.0.0.1:7000`.
 ## Quick Start (Node legacy)
 
 `addon.js` is the original Node implementation (proxied streams). It is kept
-for reference / Vercel serverless (`api/index.js`). For local use, prefer the
-Python server above.
+for reference. For local use, prefer the Python server above.
 
 ## Install in Stremio
 

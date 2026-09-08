@@ -1,4 +1,3 @@
-.vercel
 .env*
 server.log
 node_modules/
