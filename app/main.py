@@ -34,7 +34,7 @@ _client_loop: object | None = None
 
 
 def _make_client() -> httpx.AsyncClient:
-    limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
+    limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
     return httpx.AsyncClient(
         http2=True,  # HTTP/2 where supported, HTTP/1.1 fallback otherwise
         limits=limits,
@@ -128,5 +128,5 @@ if __name__ == "__main__":
 
     host = config.HOST
     port = config.PORT
-    log.info("serving with Granian on http://%s:%s", host, port)
-    Granian("app.main:app", interface="asgi", address=host, port=port).serve()
+    log.info("serving with Granian on http://%s:%s workers=1 (1:1)", host, port)
+    Granian("app.main:app", interface="asgi", address=host, port=port, workers=1).serve()
