@@ -356,13 +356,18 @@ async def resolve_movy_streams(
                 params["imdbId"] = str(meta["imdbId"])
             query = urlencode(params)
 
-            results = await asyncio.gather(
-                *(_fetch_server(client, s, query, str(tmdb_id), seed) for s in config.MOVY_SERVERS)
-            )
+            # Show all US servers only (VPS never proxies video — direct streams)
             streams: list[dict] = []
-            for server, sources in zip(config.MOVY_SERVERS, results):
+            us_servers = [s for s in config.MOVY_SERVERS if s not in ("cancun", "paris")]
+            # parallel fetch 6 US servers (down from 8), still aggregated
+            results = await asyncio.gather(
+                *(_fetch_server(client, s, query, str(tmdb_id), seed) for s in us_servers)
+            )
+            for server, sources in zip(us_servers, results):
                 for src in sources:
-                    streams.append(_build_stream(server, src.get("quality"), src.get("url", "")))
+                    url = src.get("url", "")
+                    if url:
+                        streams.append(_build_stream(server, src.get("quality"), url))
             async with _cache_lock:
                 _stream_cache[cache_key] = (time.time(), streams)
             return streams
