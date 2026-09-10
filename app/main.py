@@ -34,7 +34,10 @@ _client_loop: object | None = None
 
 
 def _make_client() -> httpx.AsyncClient:
-    limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
+    # Small pool buffer so concurrent Stremio requests don't block each other.
+    # max_connections=1 serializes all upstream calls and stalls asyncio
+    # handlers under concurrent load — keep a modest pool instead.
+    limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
     return httpx.AsyncClient(
         http2=True,  # HTTP/2 where supported, HTTP/1.1 fallback otherwise
         limits=limits,

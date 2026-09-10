@@ -59,6 +59,23 @@ _pending: dict[str, asyncio.Task] = {}
 _meta_cache: dict[str, tuple[float, dict]] = {}
 _cache_lock = asyncio.Lock()
 
+# Circuit breaker for the Movy sidecar (MOVY_API). When the provider is
+# down (5xx / connect errors), we back off for a short window instead of
+# hammering it on every Stremio request. Checked at the top of
+# resolve_movy_streams — must actually be consulted before firing requests.
+_down_until: float = 0.0
+_CIRCUIT_BACKOFF = 30.0
+
+
+def _circuit_open() -> bool:
+    return time.time() < _down_until
+
+
+def _trip_circuit(backoff: float = _CIRCUIT_BACKOFF) -> None:
+    global _down_until
+    _down_until = time.time() + backoff
+    log.warning("movy sidecar backing off for %.0fs", backoff)
+
 
 def get_keys() -> tuple[str | None, str | None]:
     tmdb = config.TMDB_API_KEY or random.choice(_TMDB_KEYS)
@@ -287,6 +304,13 @@ async def resolve_movy_streams(
     season: int = 1,
     episode: int = 1,
 ) -> list[dict]:
+    # Early exit if sidecar is backing off — don't fire requests while
+    # the circuit is open. (All HTTP below routes via `client`, so no
+    # orphaned global httpx.get() calls can bypass this either.)
+    if _circuit_open():
+        log.info("movy sidecar backing off — skipping")
+        return []
+
     media_type = "movie" if type_ == "movie" else "tv"
     tmdb_id = extract_tmdb_id(stremio_id)
     imdb_id = extract_imdb_id(stremio_id)
@@ -317,19 +341,33 @@ async def resolve_movy_streams(
 
     async def _run() -> list[dict]:
         try:
-            # Seed fetch with silent 429 backoff
+            # Seed fetch with silent 429 backoff.
+            # NOTE: every request here uses the shared `client` (keep-alive
+            # pool) — never global httpx.get(), which would bypass pooling
+            # with a fresh TLS handshake per call.
             seed = None
             for attempt in range(3):
-                r = await client.get(
-                    f"{config.MOVY_API}/seed",
-                    params={"mediaId": tmdb_id},
-                    headers={"User-Agent": config.UA},
-                    timeout=15,
-                )
+                try:
+                    r = await client.get(
+                        f"{config.MOVY_API}/seed",
+                        params={"mediaId": tmdb_id},
+                        headers={"User-Agent": config.UA},
+                        timeout=15,
+                    )
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
+                    # Provider unreachable — open the circuit, fail fast.
+                    log.warning("movy seed unreachable: %s", e)
+                    _trip_circuit()
+                    return []
                 if r.status_code == 429:
                     if attempt < 2:
                         await asyncio.sleep(_retry_after_seconds(r, 1.5 + attempt))
                         continue
+                    return []
+                if r.status_code >= 500:
+                    # Provider outage (not rate-limit) — back off.
+                    log.warning("movy seed %s — backing off", r.status_code)
+                    _trip_circuit()
                     return []
                 r.raise_for_status()
                 seed = r.json()["seed"]
@@ -356,13 +394,15 @@ async def resolve_movy_streams(
                 params["imdbId"] = str(meta["imdbId"])
             query = urlencode(params)
 
-            # 1:1 — single US server, single connection (VPS never proxies video — direct)
+            # Single US server, sequential fallback (VPS never proxies video — direct).
+            # The shared client pool (max_connections=10) lets concurrent
+            # Stremio requests proceed without blocking each other.
             streams: list[dict] = []
             us_servers = [s for s in config.MOVY_SERVERS if s not in ("cancun", "paris")]
             # deterministic single server (miami) — 1 VPS request : 1 upstream, no fan-out
             server = us_servers[0]  # miami
             sources = await _fetch_server(client, server, query, str(tmdb_id), seed)
-            # fallback sequentially only if first is empty (still 1 at a time, max 1 live connection)
+            # fallback sequentially only if first is empty (still 1 at a time per request)
             if not sources:
                 for fallback in us_servers[1:]:
                     sources = await _fetch_server(client, fallback, query, str(tmdb_id), seed)
@@ -377,11 +417,16 @@ async def resolve_movy_streams(
                 _stream_cache[cache_key] = (time.time(), streams)
             return streams
         except Exception as e:
-            # Don't spam stdout on rate-limits — degrade silently
+            # Don't spam stdout on rate-limits — degrade silently.
+            # 429s never trip the breaker (rate-limit, not outage).
             if "429" in str(e):
                 log.debug("movy 429 suppressed: %s", e)
             else:
                 log.warning("movy error: %s", e)
+                if isinstance(e, (httpx.ConnectError, httpx.TimeoutException)) or any(
+                    code in str(e) for code in ("500", "502", "503", "504")
+                ):
+                    _trip_circuit()
             return []
         finally:
             async with _cache_lock:
